@@ -8,9 +8,8 @@
 - `scripts/script0_merge_player_pgns.py`
   - Reused stage-0 merge behavior.
   - Simplified output logging and validation.
-- `scripts/script_chesscom_download_player_pgns.py`
-  - Reused Chess.com archive download flow.
-  - Kept merged-output option for stage-1 input.
+- `scripts/script_chesscom_db_bulk_download.py`
+  - Main Chess.com download workflow for both pretrain and finetune storage modes.
 
 ## Rewritten to match AGENTS.md
 
@@ -26,9 +25,9 @@
     - dense state summary features
     - padded history tensors + mask
     - legal-from mask and legal-to map
-- `scripts/script3_train_history_policy.py`
-  - Old: grouped-softmax candidate scorer (`HCMLP`).
-  - New: history-conditioned factorized policy model:
+- `scripts/script4_finetune_history_policy.py`
+  - Old pipeline ended at candidate-ranking trainer.
+  - New: history-conditioned factorized policy model adaptation:
     - state encoder (HalfKP sparse + dense)
     - GRU history encoder (events + deltas)
     - factorized legal-masked heads (`from -> to -> promotion`)

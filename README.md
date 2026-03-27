@@ -52,6 +52,26 @@ Outputs:
 - `models/<dataset>/history_policy_metrics.json`
 - `models/<dataset>/honest_split_game_ids.json`
 
+### C) Replay analysis (game-level visual diagnostics)
+
+Run:
+
+```bash
+python scripts/replay_analysis.py
+```
+
+Configure target/model/game in `scripts/replay_analysis.py` `CONFIG`.
+
+Outputs under:
+- `outputs/<dataset>/replay_<game_id>/`
+
+Includes:
+- `boards/*.svg` (actual vs predicted arrows)
+- `replay_details.jsonl`
+- `replay_summary.csv`
+- `overall_metrics.json` (with confidence gate + phase metrics)
+- `index.html` (interactive move-by-move board viewer)
+
 ## Scraper Browser Settings
 
 In `script_chesscom_db_bulk_download.py`:
