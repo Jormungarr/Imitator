@@ -1,0 +1,32 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+.playwright_chesscom_profile/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Project outputs and generated artifacts
+data/processed/
+models/
+outputs/
+
+# Local test engine artifacts
+test/stockfish_engine/
+
+# Logs
+*.log
