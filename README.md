@@ -107,4 +107,5 @@ Fine-tuning uses game-level `train/valid/test` split.
 
 - Pretraining data reference: [docs/data_sources.md](docs/data_sources.md)
 - TWIC (The Week in Chess): https://theweekinchess.com/twic
+- Chess.com Games (target-player fine-tune source): https://www.chess.com/games
 
