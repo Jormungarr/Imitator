@@ -17,9 +17,9 @@ This summary is intended for Codex to understand the design direction and implem
 ### Goal
 Model the move choice distribution of a target player:
 
-\[
+$$
 P(m_t \mid s_t, h_t, c_t)
-\]
+$$
 
 where:
 
