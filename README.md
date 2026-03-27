@@ -102,3 +102,9 @@ Fine-tuning uses game-level `train/valid/test` split.
 - Fine-tuning loads only pretrained `state_encoder` + `history_encoder` by default.
 - Policy heads stay highly adaptable for style fidelity.
 - Training uses mini-batches (`EmbeddingBag`) with per-epoch progress and ETA.
+
+## Data Sources
+
+- Pretraining data reference: [docs/data_sources.md](docs/data_sources.md)
+- TWIC (The Week in Chess): https://theweekinchess.com/twic
+
