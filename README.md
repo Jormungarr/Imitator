@@ -107,15 +107,7 @@ Fine-tuning uses game-level `train/valid/test` split.
 
 The current model represents a move as the tuple `m = (f,t,p)` and predicts it with factorized heads:
 
-$$
-\hat P(m \mid s,h,c)
-=
-\hat P(f,t,p \mid s,h,c)
-=
-\hat P(f \mid s,h,c)\;
-\hat P(t \mid f,s,h,c)\;
-\hat P(p \mid f,t,s,h,c)
-$$
+$$ \hat P(m \mid s,h,c) = \hat P(f,t,p \mid s,h,c) = \hat P(f \mid s,h,c)\hat P(t \mid f,s,h,c)\hat P(p \mid f,t,s,h,c) $$
 
 where:
 - `s` = current board state
@@ -127,13 +119,7 @@ where:
 
 Equivalently:
 
-$$
-\hat P(f,t,p \mid s,h,c)
-=
-\hat P_{\mathrm{from}}(f \mid s,h,c)\;
-\hat P_{\mathrm{to}}(t \mid f,s,h,c)\;
-\hat P_{\mathrm{promo}}(p \mid f,t,s,h,c)
-$$
+$$ \hat P(f,t,p \mid s,h,c) = \hat P_{\mathrm{from}}(f \mid s,h,c)\hat P_{\mathrm{to}}(t \mid f,s,h,c)\hat P_{\mathrm{promo}}(p \mid f,t,s,h,c) $$
 
 At inference time this is combined with legal-move constraints, so illegal `from` and `to` choices are masked out by the current position.
 
