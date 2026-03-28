@@ -127,11 +127,11 @@ At inference time this is combined with legal-move constraints, so illegal `from
 ## Derivation
 
 Let:
-- `x_s` = sparse current-state features
-- `x_d` = dense current-state features
-- `x_h^evt` = move-event history sequence
-- `x_h^delta` = state-delta history sequence
-- `x_c` = context features
+- $x_s$ = sparse current-state features
+- $x_d$ = dense current-state features
+- $x_h^{evt}$ = move-event history sequence
+- $x_h^{delta}$ = state-delta history sequence
+- $x_c$ = context features
 
 The encoder stack is:
 
@@ -144,9 +144,9 @@ $$ z_c = f_{\mathrm{ctx}}(x_c) $$
 $$ z = f_{\mathrm{fuse}}([z_s, z_h, z_c]) $$
 
 The move is parameterized as `m = (f,t,p)`, where:
-- `f` = from-square
-- `t` = to-square
-- `p` = promotion class
+- $f$ = from-square
+- $t$ = to-square
+- $p$ = promotion class
 
 The model factorization is:
 
