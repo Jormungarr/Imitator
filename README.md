@@ -1,4 +1,4 @@
-﻿# Imitator (History-Conditioned Policy)
+# Imitator (History-Conditioned Policy)
 
 This project follows `AGENTS.md`: model player move choice directly with current state + recent trajectory, not candidate ranking against engine lines.
 
@@ -20,6 +20,7 @@ This now includes merge-first flow:
 - Stage 3: pretrain model
 
 Low-RAM full-data option (streamed Stage 3 only):
+
 ```bash
 python scripts/script3_pretrain_history_policy_stream.py
 ```
@@ -123,9 +124,66 @@ $$ \hat P(f,t,p \mid s,h,c) = \hat P_{\mathrm{from}}(f \mid s,h,c)\hat P_{\mathr
 
 At inference time this is combined with legal-move constraints, so illegal `from` and `to` choices are masked out by the current position.
 
+## Derivation
+
+Let:
+- `x_s` = sparse current-state features
+- `x_d` = dense current-state features
+- `x_h^evt` = move-event history sequence
+- `x_h^delta` = state-delta history sequence
+- `x_c` = context features
+
+The encoder stack is:
+
+$$ z_s = f_{\mathrm{state}}(x_s, x_d) $$
+
+$$ z_h = f_{\mathrm{hist}}(x_h^{evt}, x_h^{delta}) $$
+
+$$ z_c = f_{\mathrm{ctx}}(x_c) $$
+
+$$ z = f_{\mathrm{fuse}}([z_s, z_h, z_c]) $$
+
+The move is parameterized as `m = (f,t,p)`, where:
+- `f` = from-square
+- `t` = to-square
+- `p` = promotion class
+
+The model factorization is:
+
+$$ \hat P(m \mid s,h,c) = \hat P(f,t,p \mid s,h,c) = \hat P(f \mid z)\hat P(t \mid z,f)\hat P(p \mid z,f,t) $$
+
+The three heads are:
+
+$$ \ell_f = g_{\mathrm{from}}(z) $$
+
+$$ \hat P(f \mid z) = \mathrm{Softmax}(\mathrm{MaskFrom}(\ell_f)) $$
+
+$$ e_f = E_{\square}(f) $$
+
+$$ \ell_t = g_{\mathrm{to}}([z, e_f]) $$
+
+$$ \hat P(t \mid z,f) = \mathrm{Softmax}(\mathrm{MaskTo}(\ell_t; f)) $$
+
+$$ e_t = E_{\square}(t) $$
+
+$$ \ell_p = g_{\mathrm{promo}}([z, e_f, e_t]) $$
+
+$$ \hat P(p \mid z,f,t) = \mathrm{Softmax}(\ell_p) $$
+
+So the full move probability is:
+
+$$ \hat P(f,t,p \mid s,h,c) = \mathrm{Softmax}(\mathrm{MaskFrom}(g_{\mathrm{from}}(z)))[f]\cdot \mathrm{Softmax}(\mathrm{MaskTo}(g_{\mathrm{to}}([z, E_{\square}(f)]); f))[t]\cdot \mathrm{Softmax}(g_{\mathrm{promo}}([z, E_{\square}(f), E_{\square}(t)]))[p] $$
+
+with
+
+$$ z = f_{\mathrm{fuse}}([f_{\mathrm{state}}(x_s, x_d), f_{\mathrm{hist}}(x_h^{evt}, x_h^{delta}), f_{\mathrm{ctx}}(x_c)]) $$
+
+The training objective is the weighted negative log-likelihood of the observed move components:
+
+$$ \mathcal L = -\log \hat P(f^\ast \mid z) - \log \hat P(t^\ast \mid z,f^\ast) - 0.25 \log \hat P(p^\ast \mid z,f^\ast,t^\ast) $$
+
 ## Data Sources
 
 - Pretraining data reference: [docs/data_sources.md](docs/data_sources.md)
 - TWIC (The Week in Chess): https://theweekinchess.com/twic
 - Chess.com Games (target-player fine-tune source): https://www.chess.com/games
-
