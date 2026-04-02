@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Local desktop chess app to play against selectable player-style checkpoints."""
 
 from __future__ import annotations
@@ -14,14 +14,19 @@ import torch
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
-from history_policy_lib import FactorizedPolicyModel, PolicySample, collate_batch, load_checkpoint, masked_logits
+from history_policy_lib import FactorizedPolicyModel, PolicySample, collate_batch, load_checkpoint, masked_logits, resolve_from_square
 from pipeline_config import PROJECT_ROOT
-from script1_parse_pgn_to_positions import (
+from chess_feature_utils import (
+    apply_piece_identity_move,
     build_history_entry,
+    canonical_piece_slot,
+    current_original_piece_slot_square_map,
+    current_piece_identity,
+    initialize_piece_identity_tracker,
     normalize_square,
     phase_code_from_fullmove,
-    promotion_index,
 )
+from script1_parse_pgn_to_positions import promotion_index
 from script2_encode_policy_samples import encode_row
 
 
@@ -126,6 +131,7 @@ class ChessStyleSession:
         self.human_color = chess.WHITE
         self.model_color = chess.BLACK
         self.last_model_move = ""
+        self.piece_id_by_square, self.promotion_counters = initialize_piece_identity_tracker(self.board)
 
     @staticmethod
     def _sample_from_encoded(enc: Dict[str, Any]) -> PolicySample:
@@ -136,9 +142,13 @@ class ChessStyleSession:
             dense_state=[float(x) for x in enc["dense_state"]],
             history_event=[[float(v) for v in x] for x in enc["history_event"]],
             history_delta=[[float(v) for v in x] for x in enc["history_delta"]],
+            history_mask=[int(x) for x in enc.get("history_mask", [1] * len(enc["history_event"]))],
             context=[float(x) for x in enc["context"]],
+            piece_slot_to_square=[int(x) for x in enc.get("piece_slot_to_square", [-1] * 16)],
+            legal_piece_slot_mask=[int(x) for x in enc.get("legal_piece_slot_mask", [0] * 16)],
             legal_from_mask=[int(x) for x in enc["legal_from_mask"]],
             legal_to_by_from={str(k): [int(v) for v in vals] for k, vals in enc["legal_to_by_from"].items()},
+            target_piece_slot=int(enc.get("target_piece_slot", 0)),
             target_from_sq=int(enc["target_from_sq"]),
             target_to_sq=int(enc["target_to_sq"]),
             target_promotion=int(enc.get("target_promotion", 0)),
@@ -155,13 +165,16 @@ class ChessStyleSession:
 
     def _record_move(self, move: chess.Move) -> None:
         target_is_white = bool(self.model_color == chess.WHITE)
+        moved_piece_id = current_piece_identity(self.piece_id_by_square, move.from_square)
         entry = build_history_entry(
             board_before=self.board,
             move=move,
             target_color=self.model_color,
             target_is_white=target_is_white,
+            moved_piece_id=moved_piece_id,
         )
         self.history.append(entry)
+        apply_piece_identity_move(self.board, self.piece_id_by_square, move, self.promotion_counters)
         self.board.push(move)
 
     def _encode_current(self) -> PolicySample:
@@ -172,15 +185,30 @@ class ChessStyleSession:
         if not legal_moves:
             raise ValueError("No legal moves available")
 
-        dummy = legal_moves[0]
+        dummy = None
+        moved_piece_id = ""
+        moved_piece_slot = ""
+        for mv in legal_moves:
+            pid = current_piece_identity(self.piece_id_by_square, mv.from_square)
+            slot = canonical_piece_slot(pid)
+            if slot is not None:
+                dummy = mv
+                moved_piece_id = pid
+                moved_piece_slot = slot
+                break
+        if dummy is None:
+            raise ValueError("No legal move from canonical original piece slots")
+
         row = {
             "game_id": "live_game",
             "player_id": self.player_model.slug.lower(),
             "fen_before": self.board.fen(),
             "phase_code": phase_code_from_fullmove(self.board.fullmove_number),
             "target_is_white": int(target_is_white),
-            "clock_after_move_sec": 0.0,
             "history": list(self.history)[-self.player_model.history_plies :],
+            "moved_piece_id": moved_piece_id,
+            "moved_piece_slot": moved_piece_slot,
+            "piece_slot_to_square": current_original_piece_slot_square_map(self.piece_id_by_square, self.model_color, target_is_white),
             "target_from_sq": normalize_square(dummy.from_square, target_is_white),
             "target_to_sq": normalize_square(dummy.to_square, target_is_white),
             "target_promotion": promotion_index(dummy),
@@ -198,8 +226,8 @@ class ChessStyleSession:
 
         with torch.no_grad():
             fused = self.player_model.model.fused_repr(batch)
-            from_logits = masked_logits(self.player_model.model.from_logits(fused), batch["legal_from_mask"])[0]
-            from_probs = torch.softmax(from_logits, dim=0)
+            piece_logits = masked_logits(self.player_model.model.piece_logits(fused), batch["legal_piece_slot_mask"])[0]
+            piece_probs = torch.softmax(piece_logits, dim=0)
 
             to_cache: Dict[int, torch.Tensor] = {}
             promo_cache: Dict[Tuple[int, int], torch.Tensor] = {}
@@ -211,6 +239,13 @@ class ChessStyleSession:
                 rel_from = int(normalize_square(mv.from_square, target_is_white))
                 rel_to = int(normalize_square(mv.to_square, target_is_white))
                 rel_promo = int(promotion_index(mv))
+                piece_slot = int(batch["target_piece"][0].item()) if rel_from == int(batch["target_from"][0].item()) else None
+                for idx, sq in enumerate(sample.piece_slot_to_square):
+                    if sq == rel_from:
+                        piece_slot = idx
+                        break
+                if piece_slot is None:
+                    continue
 
                 if rel_from not in to_cache:
                     to_mask = self._to_mask_for_from(sample, rel_from, self.device)
@@ -229,7 +264,7 @@ class ChessStyleSession:
                     )[0]
                     promo_cache[key] = torch.softmax(promo_logits, dim=0)
 
-                p = float(from_probs[rel_from].item())
+                p = float(piece_probs[piece_slot].item())
                 p *= float(to_cache[rel_from][rel_to].item())
                 p *= float(promo_cache[key][rel_promo].item())
                 if p > best_score:
@@ -248,6 +283,7 @@ class ChessStyleSession:
         self.board = chess.Board()
         self.history.clear()
         self.last_model_move = ""
+        self.piece_id_by_square, self.promotion_counters = initialize_piece_identity_tracker(self.board)
 
         self.human_color = chess.WHITE if human_color == "white" else chess.BLACK
         self.model_color = chess.BLACK if self.human_color == chess.WHITE else chess.WHITE
@@ -275,6 +311,7 @@ class ChessStyleSession:
 
         self._record_move(mv)
         self.last_model_move = ""
+        self.piece_id_by_square, self.promotion_counters = initialize_piece_identity_tracker(self.board)
 
         if not self.board.is_game_over() and self.board.turn == self.model_color:
             model_mv = self._choose_model_move()
@@ -564,3 +601,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+

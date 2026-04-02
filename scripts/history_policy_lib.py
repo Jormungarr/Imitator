@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Shared dataset/model/training utilities for history-conditioned policy learning."""
 
 from __future__ import annotations
@@ -26,12 +26,17 @@ class PolicySample:
     dense_state: List[float]
     history_event: List[List[float]]
     history_delta: List[List[float]]
+    history_mask: List[int]
     context: List[float]
+    piece_slot_to_square: List[int]
+    legal_piece_slot_mask: List[int]
     legal_from_mask: List[int]
     legal_to_by_from: Dict[str, List[int]]
+    target_piece_slot: int
     target_from_sq: int
     target_to_sq: int
     target_promotion: int
+    target_under_threat: int
 
 
 def set_seed(seed: int) -> None:
@@ -59,12 +64,17 @@ def _row_to_sample(row: Dict[str, Any]) -> PolicySample:
         dense_state=[float(x) for x in row["dense_state"]],
         history_event=[[float(v) for v in x] for x in row["history_event"]],
         history_delta=[[float(v) for v in x] for x in row["history_delta"]],
+        history_mask=[int(x) for x in row.get("history_mask", [1] * len(row["history_event"]))],
         context=[float(x) for x in row["context"]],
+        piece_slot_to_square=[int(x) for x in row.get("piece_slot_to_square", [-1] * 16)],
+        legal_piece_slot_mask=[int(x) for x in row.get("legal_piece_slot_mask", [0] * 16)],
         legal_from_mask=[int(x) for x in row["legal_from_mask"]],
         legal_to_by_from={str(k): [int(v) for v in vals] for k, vals in row["legal_to_by_from"].items()},
+        target_piece_slot=int(row.get("target_piece_slot", 0)),
         target_from_sq=int(row["target_from_sq"]),
         target_to_sq=int(row["target_to_sq"]),
         target_promotion=int(row.get("target_promotion", 0)),
+        target_under_threat=int(row.get("target_under_threat", 0)),
     )
 
 
@@ -149,6 +159,9 @@ def batch_iter(samples: List[PolicySample], batch_size: int, shuffle: bool) -> I
         yield [samples[i] for i in batch_idx]
 
 
+PIECE_SLOT_DIM = 16
+
+
 def _legal_to_mask(sample: PolicySample, from_sq: int, device: torch.device) -> torch.Tensor:
     mask = torch.zeros(64, dtype=torch.float32, device=device)
     targets = sample.legal_to_by_from.get(str(int(from_sq)), [])
@@ -167,7 +180,10 @@ def collate_batch(batch: List[PolicySample], device: torch.device) -> Dict[str, 
     dense_state = torch.tensor([s.dense_state for s in batch], dtype=torch.float32, device=device)
     history_event = torch.tensor([s.history_event for s in batch], dtype=torch.float32, device=device)
     history_delta = torch.tensor([s.history_delta for s in batch], dtype=torch.float32, device=device)
+    history_mask = torch.tensor([s.history_mask for s in batch], dtype=torch.float32, device=device)
     context = torch.tensor([s.context for s in batch], dtype=torch.float32, device=device)
+    piece_slot_to_square = torch.tensor([s.piece_slot_to_square for s in batch], dtype=torch.long, device=device)
+
 
     # Harden training against occasional data inconsistencies: always keep target squares legal.
     legal_from_rows: List[List[int]] = []
@@ -182,9 +198,11 @@ def collate_batch(batch: List[PolicySample], device: torch.device) -> Dict[str, 
         legal_from_rows.append(row)
     legal_from_mask = torch.tensor(legal_from_rows, dtype=torch.float32, device=device)
 
+    target_piece = torch.tensor([s.target_piece_slot for s in batch], dtype=torch.long, device=device)
     target_from = torch.tensor([s.target_from_sq for s in batch], dtype=torch.long, device=device)
     target_to = torch.tensor([s.target_to_sq for s in batch], dtype=torch.long, device=device)
     target_promo = torch.tensor([s.target_promotion for s in batch], dtype=torch.long, device=device)
+    target_under_threat = torch.tensor([s.target_under_threat for s in batch], dtype=torch.float32, device=device)
 
     flat_indices: List[int] = []
     offsets: List[int] = []
@@ -197,6 +215,18 @@ def collate_batch(batch: List[PolicySample], device: torch.device) -> Dict[str, 
 
     sparse_indices = torch.tensor(flat_indices, dtype=torch.long, device=device)
     sparse_offsets = torch.tensor(offsets, dtype=torch.long, device=device)
+
+    legal_piece_rows: List[List[int]] = []
+    for s in batch:
+        row = [int(v) for v in s.legal_piece_slot_mask]
+        if len(row) < PIECE_SLOT_DIM:
+            row = row + [0] * (PIECE_SLOT_DIM - len(row))
+        else:
+            row = row[:PIECE_SLOT_DIM]
+        if 0 <= int(s.target_piece_slot) < PIECE_SLOT_DIM:
+            row[int(s.target_piece_slot)] = 1
+        legal_piece_rows.append(row)
+    legal_piece_slot_mask = torch.tensor(legal_piece_rows, dtype=torch.float32, device=device)
 
     legal_to_mask_rows: List[torch.Tensor] = []
     for s in batch:
@@ -211,11 +241,16 @@ def collate_batch(batch: List[PolicySample], device: torch.device) -> Dict[str, 
         "dense_state": dense_state,
         "history_event": history_event,
         "history_delta": history_delta,
+        "history_mask": history_mask,
         "context": context,
+        "piece_slot_to_square": piece_slot_to_square,
+        "legal_piece_slot_mask": legal_piece_slot_mask,
         "legal_from_mask": legal_from_mask,
+        "target_piece": target_piece,
         "target_from": target_from,
         "target_to": target_to,
         "target_promo": target_promo,
+        "target_under_threat": target_under_threat,
         "sparse_indices": sparse_indices,
         "sparse_offsets": sparse_offsets,
         "legal_to_mask_target": legal_to_mask_target,
@@ -246,22 +281,22 @@ class StateEncoder(nn.Module):
 class HistoryEncoder(nn.Module):
     """Encode move-event and state-delta sequences using GRU."""
 
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(self, hidden_dim: int, event_flag_dim: int, delta_dim: int) -> None:
         super().__init__()
         emb = 16
         self.mover_emb = nn.Embedding(2, emb)
         self.piece_emb = nn.Embedding(7, emb)
         self.square_emb = nn.Embedding(64, emb)
-        self.flag_proj = nn.Linear(4, 16)
-        self.delta_proj = nn.Linear(3, 16)
-        self.gru = nn.GRU(input_size=emb * 4 + 16 + 16, hidden_size=hidden_dim, batch_first=True)
+        self.flag_proj = nn.Linear(event_flag_dim, 24)
+        self.delta_proj = nn.Linear(delta_dim, 24)
+        self.gru = nn.GRU(input_size=emb * 4 + 24 + 24, hidden_size=hidden_dim, batch_first=True)
 
-    def forward(self, history_event: torch.Tensor, history_delta: torch.Tensor) -> torch.Tensor:
+    def forward(self, history_event: torch.Tensor, history_delta: torch.Tensor, history_mask: torch.Tensor) -> torch.Tensor:
         mover = history_event[:, :, 0].long().clamp(min=0, max=1)
         piece = history_event[:, :, 1].long().clamp(min=0, max=6)
         from_sq = history_event[:, :, 2].long().clamp(min=0, max=63)
         to_sq = history_event[:, :, 3].long().clamp(min=0, max=63)
-        flags = history_event[:, :, 4:8]
+        flags = history_event[:, :, 4:]
 
         seq = torch.cat(
             [
@@ -275,7 +310,10 @@ class HistoryEncoder(nn.Module):
             dim=-1,
         )
         output, _ = self.gru(seq)
-        return output[:, -1, :]
+        mask = history_mask.unsqueeze(-1).to(output.dtype)
+        masked_sum = (output * mask).sum(dim=1)
+        valid_steps = mask.sum(dim=1).clamp_min(1.0)
+        return masked_sum / valid_steps
 
 
 class FactorizedPolicyModel(nn.Module):
@@ -283,6 +321,8 @@ class FactorizedPolicyModel(nn.Module):
 
     def __init__(self, config: Dict[str, Any]) -> None:
         super().__init__()
+        self.enable_threat_head = bool(config.get("enable_threat_head", False))
+        self.threat_loss_weight = float(config.get("threat_loss_weight", 0.2))
         shared_hidden = int(config["shared_hidden_dim"])
 
         self.state_encoder = StateEncoder(
@@ -291,7 +331,11 @@ class FactorizedPolicyModel(nn.Module):
             dense_state_dim=int(config["dense_state_dim"]),
             hidden_dim=shared_hidden,
         )
-        self.history_encoder = HistoryEncoder(hidden_dim=int(config["history_hidden_dim"]))
+        self.history_encoder = HistoryEncoder(
+            hidden_dim=int(config["history_hidden_dim"]),
+            event_flag_dim=int(config["history_event_dim"]) - 4,
+            delta_dim=int(config["history_delta_dim"]),
+        )
         self.context_proj = nn.Linear(int(config["context_dim"]), 16)
 
         fused_dim = self.state_encoder.out_dim + int(config["history_hidden_dim"]) + 16
@@ -302,7 +346,7 @@ class FactorizedPolicyModel(nn.Module):
         )
 
         self.square_emb = nn.Embedding(64, 16)
-        self.from_head = nn.Linear(shared_hidden, 64)
+        self.piece_head = nn.Linear(shared_hidden, PIECE_SLOT_DIM)
         self.to_head = nn.Sequential(
             nn.Linear(shared_hidden + 16, shared_hidden),
             nn.ReLU(),
@@ -313,15 +357,17 @@ class FactorizedPolicyModel(nn.Module):
             nn.ReLU(),
             nn.Linear(shared_hidden, 5),
         )
+        if self.enable_threat_head:
+            self.threat_head = nn.Linear(shared_hidden, 1)
 
     def fused_repr(self, batch: Dict[str, Any]) -> torch.Tensor:
         state = self.state_encoder(batch["sparse_indices"], batch["sparse_offsets"], batch["dense_state"])
-        hist = self.history_encoder(batch["history_event"], batch["history_delta"])
+        hist = self.history_encoder(batch["history_event"], batch["history_delta"], batch["history_mask"])
         ctx = self.context_proj(batch["context"])
         return self.fusion(torch.cat([state, hist, ctx], dim=1))
 
-    def from_logits(self, fused: torch.Tensor) -> torch.Tensor:
-        return self.from_head(fused)
+    def piece_logits(self, fused: torch.Tensor) -> torch.Tensor:
+        return self.piece_head(fused)
 
     def to_logits(self, fused: torch.Tensor, from_sq: torch.Tensor) -> torch.Tensor:
         from_repr = self.square_emb(from_sq.long())
@@ -332,39 +378,65 @@ class FactorizedPolicyModel(nn.Module):
         to_repr = self.square_emb(to_sq.long())
         return self.promo_head(torch.cat([fused, from_repr, to_repr], dim=1))
 
+    def threat_logits(self, fused: torch.Tensor) -> torch.Tensor:
+        if not self.enable_threat_head:
+            raise RuntimeError("Threat head disabled for this checkpoint/config")
+        return self.threat_head(fused).squeeze(1)
+
+
+def resolve_from_square(piece_slot_to_square: torch.Tensor, piece_slot: torch.Tensor) -> torch.Tensor:
+    """Gather current from-square from predicted or target piece slot."""
+    idx = piece_slot.long().unsqueeze(1)
+    resolved = piece_slot_to_square.gather(1, idx).squeeze(1)
+    return resolved.clamp(min=0)
+
 
 def batch_loss(model: FactorizedPolicyModel, batch: Dict[str, Any]) -> torch.Tensor:
     """Compute factorized move loss for one mini-batch."""
     fused = model.fused_repr(batch)
 
-    from_logits = masked_logits(model.from_logits(fused), batch["legal_from_mask"])
-    from_loss = F.cross_entropy(from_logits, batch["target_from"])
+    piece_logits = masked_logits(model.piece_logits(fused), batch["legal_piece_slot_mask"])
+    piece_loss = F.cross_entropy(piece_logits, batch["target_piece"])
 
-    to_logits = masked_logits(model.to_logits(fused, batch["target_from"]), batch["legal_to_mask_target"])
+    target_from = resolve_from_square(batch["piece_slot_to_square"], batch["target_piece"])
+    to_logits = masked_logits(model.to_logits(fused, target_from), batch["legal_to_mask_target"])
     to_loss = F.cross_entropy(to_logits, batch["target_to"])
 
-    promo_logits = model.promo_logits(fused, batch["target_from"], batch["target_to"])
+    promo_logits = model.promo_logits(fused, target_from, batch["target_to"])
     promo_loss = F.cross_entropy(promo_logits, batch["target_promo"])
 
-    return from_loss + to_loss + 0.25 * promo_loss
+    total_loss = piece_loss + to_loss + 0.25 * promo_loss
+    if model.enable_threat_head:
+        threat_logits = model.threat_logits(fused)
+        threat_loss = F.binary_cross_entropy_with_logits(threat_logits, batch["target_under_threat"])
+        total_loss = total_loss + model.threat_loss_weight * threat_loss
+
+    return total_loss
 
 
 @torch.no_grad()
 def evaluate(model: FactorizedPolicyModel, samples: List[PolicySample], device: torch.device, batch_size: int = 256) -> Dict[str, float]:
-    """Compute from/to/promo and exact move accuracy."""
+    """Compute piece/to/promo and exact move accuracy."""
     model.eval()
 
     total = 0
+    piece_ok = 0
     from_ok = 0
     to_ok = 0
     promo_ok = 0
     move_ok = 0
+    threat_ok = 0
+    threat_tp = 0
+    threat_fp = 0
+    threat_fn = 0
+    threat_pos = 0
 
     for batch_samples in batch_iter(samples, batch_size=batch_size, shuffle=False):
         batch = collate_batch(batch_samples, device=device)
         fused = model.fused_repr(batch)
 
-        from_pred = torch.argmax(masked_logits(model.from_logits(fused), batch["legal_from_mask"]), dim=1)
+        piece_pred = torch.argmax(masked_logits(model.piece_logits(fused), batch["legal_piece_slot_mask"]), dim=1)
+        from_pred = resolve_from_square(batch["piece_slot_to_square"], piece_pred)
 
         to_masks = torch.stack([
             _legal_to_mask(s, int(from_pred[i].item()), device=device) for i, s in enumerate(batch_samples)
@@ -372,25 +444,47 @@ def evaluate(model: FactorizedPolicyModel, samples: List[PolicySample], device: 
         to_pred = torch.argmax(masked_logits(model.to_logits(fused, from_pred), to_masks), dim=1)
 
         promo_pred = torch.argmax(model.promo_logits(fused, from_pred, to_pred), dim=1)
+        if model.enable_threat_head:
+            threat_pred = (torch.sigmoid(model.threat_logits(fused)) >= 0.5).long()
 
+        tpiece = batch["target_piece"]
         tf = batch["target_from"]
         tt = batch["target_to"]
         tp = batch["target_promo"]
+        tut = batch["target_under_threat"].long()
 
         bsz = tf.shape[0]
         total += bsz
+        piece_ok += int((piece_pred == tpiece).sum().item())
         from_ok += int((from_pred == tf).sum().item())
         to_ok += int((to_pred == tt).sum().item())
         promo_ok += int((promo_pred == tp).sum().item())
-        move_ok += int(((from_pred == tf) & (to_pred == tt) & (promo_pred == tp)).sum().item())
+        move_ok += int(((piece_pred == tpiece) & (from_pred == tf) & (to_pred == tt) & (promo_pred == tp)).sum().item())
+        if model.enable_threat_head:
+            threat_ok += int((threat_pred == tut).sum().item())
+            threat_tp += int(((threat_pred == 1) & (tut == 1)).sum().item())
+            threat_fp += int(((threat_pred == 1) & (tut == 0)).sum().item())
+            threat_fn += int(((threat_pred == 0) & (tut == 1)).sum().item())
+            threat_pos += int((tut == 1).sum().item())
 
-    return {
+    metrics = {
+        "piece_acc": piece_ok / max(total, 1),
         "from_acc": from_ok / max(total, 1),
         "to_acc": to_ok / max(total, 1),
         "promo_acc": promo_ok / max(total, 1),
         "move_acc": move_ok / max(total, 1),
         "num_samples": float(total),
     }
+    if model.enable_threat_head:
+        precision = threat_tp / max(threat_tp + threat_fp, 1)
+        recall = threat_tp / max(threat_tp + threat_fn, 1)
+        f1 = 0.0 if precision + recall <= 0 else (2.0 * precision * recall) / (precision + recall)
+        metrics["threat_acc"] = threat_ok / max(total, 1)
+        metrics["threat_positive_rate"] = threat_pos / max(total, 1)
+        metrics["threat_precision"] = precision
+        metrics["threat_recall"] = recall
+        metrics["threat_f1"] = f1
+    return metrics
 
 
 def format_eta(seconds: float) -> str:
@@ -502,3 +596,5 @@ def load_pretrained_encoders(model: FactorizedPolicyModel, ckpt_path: Path, devi
 
     model.load_state_dict(own)
     return copied
+
+

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Replay one target game and analyze move-by-move policy predictions."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import chess
 import chess.svg
 import torch
 
-from history_policy_lib import FactorizedPolicyModel, PolicySample, collate_batch, load_checkpoint, masked_logits
+from history_policy_lib import FactorizedPolicyModel, PolicySample, collate_batch, load_checkpoint, masked_logits, resolve_from_square
 from pipeline_config import DATASET_TAG, HISTORY_PLIES, TARGET_NAME_ALIASES, TARGET_USERNAME, models_dir, outputs_dir, raw_pgn
 from script1_parse_pgn_to_positions import iter_target_player_positions
 from script2_encode_policy_samples import encode_row
@@ -26,7 +26,7 @@ CONFIG: Dict[str, Any] = {
     "target_name_aliases": TARGET_NAME_ALIASES,
     # Pick one selection mode: game id (preferred) or 1-based index among matched games.
     "target_game_id": None,
-    "target_game_index": 250,
+    "target_game_index": 50,
     "max_moves": 0,
     "top_k": 5,
     # Confidence gate for replay diagnostics.
@@ -69,9 +69,13 @@ def sample_from_encoded_row(row: Dict[str, Any]) -> PolicySample:
         dense_state=[float(x) for x in row["dense_state"]],
         history_event=[[float(v) for v in x] for x in row["history_event"]],
         history_delta=[[float(v) for v in x] for x in row["history_delta"]],
+        history_mask=[int(x) for x in row.get("history_mask", [1] * len(row["history_event"]))],
         context=[float(x) for x in row["context"]],
+        piece_slot_to_square=[int(x) for x in row.get("piece_slot_to_square", [-1] * 16)],
+        legal_piece_slot_mask=[int(x) for x in row.get("legal_piece_slot_mask", [0] * 16)],
         legal_from_mask=[int(x) for x in row["legal_from_mask"]],
         legal_to_by_from={str(k): [int(v) for v in vals] for k, vals in row["legal_to_by_from"].items()},
+        target_piece_slot=int(row.get("target_piece_slot", 0)),
         target_from_sq=int(row["target_from_sq"]),
         target_to_sq=int(row["target_to_sq"]),
         target_promotion=int(row.get("target_promotion", 0)),
@@ -115,7 +119,7 @@ def choose_legal_move(
 
 
 def factorized_prob(
-    from_probs: torch.Tensor,
+    piece_probs: torch.Tensor,
     to_probs: torch.Tensor,
     promo_probs: torch.Tensor,
     from_sq: int,
@@ -123,7 +127,7 @@ def factorized_prob(
     promo: int,
 ) -> float:
     """Compute factorized probability for one move tuple."""
-    p = float(from_probs[int(from_sq)].item())
+    p = float(piece_probs[int(from_sq)].item())
     p *= float(to_probs[int(to_sq)].item())
     p *= float(promo_probs[int(promo)].item())
     return p
@@ -234,9 +238,10 @@ def analyze_row(
     with torch.no_grad():
         fused = model.fused_repr(batch)
 
-        from_logits = masked_logits(model.from_logits(fused), batch["legal_from_mask"])[0]
-        from_probs = torch.softmax(from_logits, dim=0)
-        pred_from = int(torch.argmax(from_logits).item())
+        piece_logits = masked_logits(model.piece_logits(fused), batch["legal_piece_slot_mask"])[0]
+        piece_probs = torch.softmax(piece_logits, dim=0)
+        pred_piece = int(torch.argmax(piece_logits).item())
+        pred_from = int(resolve_from_square(batch["piece_slot_to_square"], torch.tensor([pred_piece], device=device))[0].item())
 
         pred_to_mask = to_mask_for_from(sample, pred_from, device)
         to_logits_pred = masked_logits(model.to_logits(fused, torch.tensor([pred_from], device=device))[0], pred_to_mask)
@@ -251,6 +256,7 @@ def analyze_row(
         promo_probs_pred = torch.softmax(promo_logits_pred, dim=0)
         pred_promo = int(torch.argmax(promo_logits_pred).item())
 
+        actual_piece = int(enc.get("target_piece_slot", 0))
         actual_from = int(row["target_from_sq"])
         actual_to = int(row["target_to_sq"])
         actual_promo = int(row.get("target_promotion", 0))
@@ -301,12 +307,12 @@ def analyze_row(
             actual_rank = i
             break
 
-    pred_prob = factorized_prob(from_probs, to_probs_pred, promo_probs_pred, pred_from, pred_to, pred_promo)
+    pred_prob = factorized_prob(piece_probs, to_probs_pred, promo_probs_pred, pred_piece, pred_to, pred_promo)
     actual_prob = factorized_prob(
-        from_probs,
+        piece_probs,
         to_probs_actual,
         promo_probs_actual,
-        actual_from,
+        actual_piece,
         actual_to,
         actual_promo,
     )

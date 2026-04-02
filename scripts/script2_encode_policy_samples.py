@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Encode history-aware position rows into model-ready JSONL samples."""
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, List
 
 import chess
 
+from chess_feature_utils import ORIGINAL_PIECE_SLOTS, ORIGINAL_SLOT_TO_INDEX, dense_state_vector, is_under_immediate_threat
 from pipeline_config import DATASET_TAG, HISTORY_PLIES, processed_dir
 
 
@@ -31,6 +32,27 @@ CASTLE_OWN_Q_IDX = 2 * HALFKP_BLOCK_DIM + 1
 CASTLE_OPP_K_IDX = 2 * HALFKP_BLOCK_DIM + 2
 CASTLE_OPP_Q_IDX = 2 * HALFKP_BLOCK_DIM + 3
 TOTAL_FEATURE_DIM = 2 * HALFKP_BLOCK_DIM + 4
+DENSE_STATE_DIM = 29
+HISTORY_EVENT_DIM = 16
+HISTORY_DELTA_DIM = 11
+PIECE_SLOT_DIM = len(ORIGINAL_PIECE_SLOTS)
+
+
+def piece_slot_square_list(mapping: Dict[str, Any]) -> List[int]:
+    squares = [-1] * PIECE_SLOT_DIM
+    for slot_name, square in mapping.items():
+        idx = ORIGINAL_SLOT_TO_INDEX.get(str(slot_name))
+        if idx is not None:
+            squares[idx] = int(square)
+    return squares
+
+
+def legal_piece_slot_mask(piece_slot_to_square_list: List[int], legal_map: Dict[str, List[int]]) -> List[int]:
+    mask = [0] * PIECE_SLOT_DIM
+    for idx, from_sq in enumerate(piece_slot_to_square_list):
+        if from_sq >= 0 and str(int(from_sq)) in legal_map:
+            mask[idx] = 1
+    return mask
 
 
 def normalize_square(square: int, mover_is_white: bool) -> int:
@@ -98,22 +120,6 @@ def encode_board_sparse_indices(fen: str) -> List[int]:
     return active
 
 
-def material_balance_from_mover(board: chess.Board) -> float:
-    """Return mover-centric material balance."""
-    values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, chess.ROOK: 5, chess.QUEEN: 9}
-    own = 0
-    opp = 0
-    for _, piece in board.piece_map().items():
-        if piece.piece_type == chess.KING:
-            continue
-        value = values.get(piece.piece_type, 0)
-        if piece.color == board.turn:
-            own += value
-        else:
-            opp += value
-    return float(own - opp)
-
-
 def legal_to_by_from(board: chess.Board) -> Dict[str, List[int]]:
     """Return legal target squares keyed by normalized from-square."""
     mapping: Dict[str, List[int]] = {}
@@ -159,18 +165,34 @@ def history_to_arrays(history: Iterable[Dict[str, Any]], history_plies: int) -> 
             float(event.get("is_check", 0)),
             float(event.get("is_castling", 0)),
             float(event.get("is_promotion", 0)),
+            float(event.get("is_exchange", 0)),
+            float(event.get("is_pawn_break", 0)),
+            float(event.get("king_pressure_gain", 0)),
+            float(event.get("pawn_structure_change", 0)),
+            float(event.get("is_simplification", 0)),
+            float(event.get("creates_opp_hanging", 0)),
+            float(event.get("creates_own_hanging", 0)),
+            float(event.get("attacks_high_value_piece", 0)),
         ])
         delta_rows.append([
             float(delta.get("material_delta", 0.0)),
             float(delta.get("king_safety_delta", 0.0)),
             float(delta.get("pawn_structure_delta", 0.0)),
+            float(delta.get("mobility_delta", 0.0)),
+            float(delta.get("center_control_delta", 0.0)),
+            float(delta.get("king_activity_delta", 0.0)),
+            float(delta.get("opp_king_pressure_delta", 0.0)),
+            float(delta.get("threat_delta", 0.0)),
+            float(delta.get("simplification_delta", 0.0)),
+            float(delta.get("own_hanging_value_delta", 0.0)),
+            float(delta.get("opp_hanging_value_delta", 0.0)),
         ])
         mask.append(1)
 
     pad = history_plies - len(event_rows)
     if pad > 0:
-        event_rows = [[0.0] * 8 for _ in range(pad)] + event_rows
-        delta_rows = [[0.0] * 3 for _ in range(pad)] + delta_rows
+        event_rows = [[0.0] * HISTORY_EVENT_DIM for _ in range(pad)] + event_rows
+        delta_rows = [[0.0] * HISTORY_DELTA_DIM for _ in range(pad)] + delta_rows
         mask = [0] * pad + mask
 
     return {
@@ -182,14 +204,12 @@ def history_to_arrays(history: Iterable[Dict[str, Any]], history_plies: int) -> 
 
 def build_dense_state(board: chess.Board, row: Dict[str, Any]) -> List[float]:
     """Build compact dense state summary features for the current position."""
-    return [
-        material_balance_from_mover(board),
-        float(row.get("phase_code", 0)),
-        float(board.legal_moves.count()),
-        float(board.has_kingside_castling_rights(board.turn)),
-        float(board.has_queenside_castling_rights(board.turn)),
-        float(board.fullmove_number),
-    ]
+    return dense_state_vector(
+        board=board,
+        target_color=bool(board.turn),
+        phase_code=int(row.get("phase_code", 0)),
+        fullmove_number=int(row.get("fullmove_number", board.fullmove_number)),
+    )
 
 
 def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
@@ -201,13 +221,17 @@ def iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 yield json.loads(line)
 
 
-def encode_row(row: Dict[str, Any], history_plies: int) -> Dict[str, Any]:
+def encode_row(row: Dict[str, Any], history_plies: int) -> Dict[str, Any] | None:
     """Encode one parsed position row into a policy training sample."""
     fen = str(row["fen_before"])
     board = chess.Board(fen)
 
     legal_map = legal_to_by_from(board)
     history_arrays = history_to_arrays(row.get("history", []), history_plies)
+    moved_piece_slot = str(row.get("moved_piece_slot") or "").strip()
+    if moved_piece_slot not in ORIGINAL_SLOT_TO_INDEX:
+        return None
+    piece_slot_squares = piece_slot_square_list(row.get("piece_slot_to_square", {}))
 
     sample = {
         "game_id": row.get("game_id"),
@@ -221,13 +245,16 @@ def encode_row(row: Dict[str, Any], history_plies: int) -> Dict[str, Any]:
         "history_mask": history_arrays["history_mask"],
         "context": [
             float(row.get("target_is_white", 0)),
-            float(row.get("clock_after_move_sec") or 0.0),
         ],
+        "piece_slot_to_square": piece_slot_squares,
+        "legal_piece_slot_mask": legal_piece_slot_mask(piece_slot_squares, legal_map),
+        "target_piece_slot": int(ORIGINAL_SLOT_TO_INDEX[moved_piece_slot]),
         "legal_from_mask": legal_from_mask(legal_map),
         "legal_to_by_from": legal_map,
         "target_from_sq": int(row["target_from_sq"]),
         "target_to_sq": int(row["target_to_sq"]),
         "target_promotion": int(row.get("target_promotion", 0)),
+        "target_under_threat": int(is_under_immediate_threat(board, bool(board.turn))),
         "target_uci": row.get("played_uci"),
     }
     return sample
@@ -249,6 +276,8 @@ def main() -> None:
     with out_path.open("w", encoding="utf-8") as out:
         for row in iter_jsonl(in_path):
             sample = encode_row(row, history_plies)
+            if sample is None:
+                continue
             out.write(json.dumps(sample, ensure_ascii=False) + "\n")
             count += 1
             if bool(CONFIG.get("verbose", True)) and progress_every > 0 and count % progress_every == 0:
@@ -257,7 +286,11 @@ def main() -> None:
     if bool(CONFIG.get("verbose", True)):
         print(f"Encoded {count} samples -> {out_path}")
         print(f"Feature vocab size (HalfKP): {TOTAL_FEATURE_DIM}")
+        print(f"Dense state dim: {DENSE_STATE_DIM} | history event dim: {HISTORY_EVENT_DIM} | history delta dim: {HISTORY_DELTA_DIM}")
 
 
 if __name__ == "__main__":
     main()
+
+
+

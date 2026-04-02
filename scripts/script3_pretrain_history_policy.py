@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Pretrain representation encoders on multi-player policy samples."""
 
 from __future__ import annotations
@@ -48,11 +48,15 @@ CONFIG: Dict[str, Any] = {
     "weight_decay": 1e-5,
     "feature_vocab_size": 81924,
     "feature_embed_dim": 64,
-    "dense_state_dim": 6,
-    "context_dim": 2,
+    "dense_state_dim": 29,
+    "context_dim": 1,
+    "history_event_dim": 16,
+    "history_delta_dim": 11,
     "history_hidden_dim": 96,
     "shared_hidden_dim": 128,
     "dropout": 0.10,
+    "enable_threat_head": True,
+    "threat_loss_weight": 0.2,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     # Set strict_target_isolation=True to remove target player from pretraining data.
     "strict_target_isolation": False,
@@ -195,3 +199,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+

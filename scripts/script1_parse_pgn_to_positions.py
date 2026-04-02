@@ -12,6 +12,16 @@ from typing import Any, Deque, Dict, Iterator, List, Optional, Tuple
 import chess
 import chess.pgn
 
+from chess_feature_utils import (
+    apply_piece_identity_move,
+    build_history_entry,
+    canonical_piece_slot,
+    current_original_piece_slot_square_map,
+    current_piece_identity,
+    initialize_piece_identity_tracker,
+    normalize_square,
+    phase_code_from_fullmove,
+)
 from pipeline_config import (
     DATASET_TAG,
     HISTORY_PLIES,
@@ -35,13 +45,6 @@ CONFIG = {
 CLK_PATTERN = re.compile(r"\[%clk\s+([0-9]+):([0-9]{2}):([0-9]{2})\]")
 NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 PARENS_RE = re.compile(r"\([^)]*\)")
-PIECE_VALUES = {
-    chess.PAWN: 1,
-    chess.KNIGHT: 3,
-    chess.BISHOP: 3,
-    chess.ROOK: 5,
-    chess.QUEEN: 9,
-}
 
 
 def parse_clock_to_seconds(comment: str) -> Optional[int]:
@@ -65,20 +68,6 @@ def safe_int(x: Optional[str]) -> Optional[int]:
         return int(x)
     except ValueError:
         return None
-
-
-def normalize_square(square: int, target_is_white: bool) -> int:
-    """Map board square to target-relative square coordinates."""
-    return square if target_is_white else chess.square_mirror(square)
-
-
-def phase_code_from_fullmove(fullmove_number: int) -> int:
-    """Return a coarse phase id (0 opening, 1 middlegame, 2 endgame)."""
-    if fullmove_number < 10:
-        return 0
-    if fullmove_number < 30:
-        return 1
-    return 2
 
 
 def clean_name(name: str) -> str:
@@ -141,7 +130,6 @@ def match_score(candidate_name: str, profile: Dict[str, Any]) -> int:
     if overlap >= 2:
         return 80
 
-    # Common variant: different first name but same family name.
     if profile["surname"] in cand_tokens:
         cand_first_initial = ""
         cand_list = name_tokens(candidate_name)
@@ -173,102 +161,12 @@ def match_target_color(white_name: str, black_name: str, profiles: List[Dict[str
     return None
 
 
-def material_balance(board: chess.Board, target_color: bool) -> float:
-    """Return target-centric material balance."""
-    own = 0
-    opp = 0
-    for _, piece in board.piece_map().items():
-        if piece.piece_type == chess.KING:
-            continue
-        value = PIECE_VALUES.get(piece.piece_type, 0)
-        if piece.color == target_color:
-            own += value
-        else:
-            opp += value
-    return float(own - opp)
-
-
-def king_safety_proxy(board: chess.Board, target_color: bool) -> float:
-    """Return a simple king-pressure differential proxy."""
-    own_king_sq = board.king(target_color)
-    opp_king_sq = board.king(not target_color)
-    if own_king_sq is None or opp_king_sq is None:
-        return 0.0
-
-    own_pressure = len(board.attackers(not target_color, own_king_sq))
-    opp_pressure = len(board.attackers(target_color, opp_king_sq))
-    return float(opp_pressure - own_pressure)
-
-
-def pawn_structure_proxy(board: chess.Board, target_color: bool) -> float:
-    """Return target-centric pawn island differential."""
-
-    def pawn_islands(color: bool) -> int:
-        files_with_pawns = set()
-        for sq, piece in board.piece_map().items():
-            if piece.color == color and piece.piece_type == chess.PAWN:
-                files_with_pawns.add(chess.square_file(sq))
-        if not files_with_pawns:
-            return 0
-        islands = 0
-        prev = None
-        for file_idx in sorted(files_with_pawns):
-            if prev is None or file_idx != prev + 1:
-                islands += 1
-            prev = file_idx
-        return islands
-
-    own = pawn_islands(target_color)
-    opp = pawn_islands(not target_color)
-    return float(opp - own)
-
-
 def promotion_index(move: chess.Move) -> int:
     """Map promotion piece type to compact id (0 none, 1 N, 2 B, 3 R, 4 Q)."""
     if move.promotion is None:
         return 0
     mapping = {chess.KNIGHT: 1, chess.BISHOP: 2, chess.ROOK: 3, chess.QUEEN: 4}
     return int(mapping.get(move.promotion, 0))
-
-
-def build_history_entry(board_before: chess.Board, move: chess.Move, target_color: bool, target_is_white: bool) -> Dict[str, Any]:
-    """Build one history step with move-event and state-delta features."""
-    piece = board_before.piece_at(move.from_square)
-    moving_piece_type = 0 if piece is None else int(piece.piece_type)
-
-    mat_before = material_balance(board_before, target_color)
-    king_before = king_safety_proxy(board_before, target_color)
-    pawn_before = pawn_structure_proxy(board_before, target_color)
-
-    is_capture = int(board_before.is_capture(move))
-    is_check = int(board_before.gives_check(move))
-    is_castling = int(board_before.is_castling(move))
-    is_promotion = int(move.promotion is not None)
-
-    board_after = board_before.copy(stack=False)
-    board_after.push(move)
-
-    mat_after = material_balance(board_after, target_color)
-    king_after = king_safety_proxy(board_after, target_color)
-    pawn_after = pawn_structure_proxy(board_after, target_color)
-
-    return {
-        "event": {
-            "mover_is_target": int(board_before.turn == target_color),
-            "piece_type": moving_piece_type,
-            "from_sq": normalize_square(move.from_square, target_is_white),
-            "to_sq": normalize_square(move.to_square, target_is_white),
-            "is_capture": is_capture,
-            "is_check": is_check,
-            "is_castling": is_castling,
-            "is_promotion": is_promotion,
-        },
-        "delta": {
-            "material_delta": mat_after - mat_before,
-            "king_safety_delta": king_after - king_before,
-            "pawn_structure_delta": pawn_after - pawn_before,
-        },
-    }
 
 
 def iter_target_player_positions(pgn_path: Path, target_username: str, aliases: List[str], history_plies: int) -> Iterator[Dict[str, Any]]:
@@ -297,6 +195,7 @@ def iter_target_player_positions(pgn_path: Path, target_username: str, aliases: 
             history: Deque[Dict[str, Any]] = deque(maxlen=history_plies)
 
             board = game.board()
+            piece_id_by_square, promotion_counters = initialize_piece_identity_tracker(board)
             game_id = headers.get("GameId") or f"game_{game_index}"
 
             node = game
@@ -304,6 +203,19 @@ def iter_target_player_positions(pgn_path: Path, target_username: str, aliases: 
             while node.variations:
                 next_node = node.variation(0)
                 move = next_node.move
+
+                if move == chess.Move.null():
+                    # Some source PGNs encode missing/unknown plies as "--".
+                    # Preserve downstream move alignment by advancing the board turn,
+                    # but do not emit a sample or inject a fake history event.
+                    board.push(move)
+                    node = next_node
+                    ply_index += 1
+                    continue
+
+                moved_piece_id = current_piece_identity(piece_id_by_square, move.from_square)
+                moved_piece_slot = canonical_piece_slot(moved_piece_id)
+                piece_slot_to_square = current_original_piece_slot_square_map(piece_id_by_square, target_color, bool(target_is_white))
 
                 if board.turn == target_color:
                     row = {
@@ -314,6 +226,9 @@ def iter_target_player_positions(pgn_path: Path, target_username: str, aliases: 
                         "fullmove_number": board.fullmove_number,
                         "fen_before": board.fen(),
                         "played_uci": move.uci(),
+                        "moved_piece_id": moved_piece_id,
+                        "moved_piece_slot": moved_piece_slot or "",
+                        "piece_slot_to_square": piece_slot_to_square,
                         "target_from_sq": normalize_square(move.from_square, target_is_white),
                         "target_to_sq": normalize_square(move.to_square, target_is_white),
                         "target_promotion": promotion_index(move),
@@ -327,13 +242,13 @@ def iter_target_player_positions(pgn_path: Path, target_username: str, aliases: 
                         "opening": headers.get("Opening"),
                         "time_control": headers.get("TimeControl"),
                         "result": headers.get("Result"),
-                        "clock_after_move_sec": parse_clock_to_seconds(next_node.comment),
                         "phase_code": phase_code_from_fullmove(board.fullmove_number),
                         "history": list(history),
                     }
                     yield row
 
-                history.append(build_history_entry(board, move, target_color, target_is_white))
+                history.append(build_history_entry(board, move, target_color, target_is_white, moved_piece_id=moved_piece_id))
+                apply_piece_identity_move(board, piece_id_by_square, move, promotion_counters)
                 board.push(move)
                 node = next_node
                 ply_index += 1
@@ -358,8 +273,6 @@ def main() -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     n_rows = 0
-    seen_games = set()
-
     with out_path.open("w", encoding="utf-8") as out:
         for row in iter_target_player_positions(
             pgn_path=Path(CONFIG["pgn_path"]),
@@ -369,11 +282,15 @@ def main() -> None:
         ):
             out.write(json.dumps(row, ensure_ascii=False) + "\n")
             n_rows += 1
-            seen_games.add(row["game_id"])
 
     if bool(CONFIG.get("verbose", True)):
-        print(f"Saved {n_rows} target-move rows from {len(seen_games)} games -> {out_path}")
+        print(f"Saved {n_rows} rows to {out_path}")
 
 
 if __name__ == "__main__":
     main()
+
+
+
+
+

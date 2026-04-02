@@ -24,6 +24,9 @@ Thumbs.db
 data/processed/
 models/
 outputs/
+kaggle/data/
+kaggle/data.zip
+data/raw/**/*.zip
 
 # Local test engine artifacts
 test/stockfish_engine/

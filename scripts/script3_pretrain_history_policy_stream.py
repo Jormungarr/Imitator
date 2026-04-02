@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Streamed pretraining entrypoint for large multi-player JSONL on limited RAM."""
 
 from __future__ import annotations
@@ -52,11 +52,15 @@ CONFIG: Dict[str, Any] = {
     "weight_decay": 1e-5,
     "feature_vocab_size": 81924,
     "feature_embed_dim": 64,
-    "dense_state_dim": 6,
-    "context_dim": 2,
+    "dense_state_dim": 29,
+    "context_dim": 1,
+    "history_event_dim": 16,
+    "history_delta_dim": 11,
     "history_hidden_dim": 96,
     "shared_hidden_dim": 128,
     "dropout": 0.10,
+    "enable_threat_head": True,
+    "threat_loss_weight": 0.2,
     "device": "cuda" if torch.cuda.is_available() else "cpu",
     # Set strict_target_isolation=True to remove target player from pretraining data.
     "strict_target_isolation": False,
@@ -88,9 +92,13 @@ def row_to_sample(row: Dict[str, Any]) -> PolicySample:
         dense_state=[float(x) for x in row["dense_state"]],
         history_event=[[float(v) for v in x] for x in row["history_event"]],
         history_delta=[[float(v) for v in x] for x in row["history_delta"]],
+        history_mask=[int(x) for x in row.get("history_mask", [1] * len(row["history_event"]))],
         context=[float(x) for x in row["context"]],
+        piece_slot_to_square=[int(x) for x in row.get("piece_slot_to_square", [-1] * 16)],
+        legal_piece_slot_mask=[int(x) for x in row.get("legal_piece_slot_mask", [0] * 16)],
         legal_from_mask=[int(x) for x in row["legal_from_mask"]],
         legal_to_by_from={str(k): [int(v) for v in vals] for k, vals in row["legal_to_by_from"].items()},
+        target_piece_slot=int(row.get("target_piece_slot", 0)),
         target_from_sq=int(row["target_from_sq"]),
         target_to_sq=int(row["target_to_sq"]),
         target_promotion=int(row.get("target_promotion", 0)),
@@ -413,3 +421,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
