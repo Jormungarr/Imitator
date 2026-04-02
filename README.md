@@ -175,7 +175,7 @@ The encoder stack is:
 
 $$ z_s = f_{\mathrm{state}}(x_s, x_d) $$
 
-$$ \tilde h_{1:K} = \mathrm{GRU}\!\left(\left[\mathrm{Emb}_{mover}, \mathrm{Emb}_{piece}, \mathrm{Emb}_{from}, \mathrm{Emb}_{to}, W_{flag}x_{flag}, W_{delta}x_h^{delta}\right]_{1:K}\right) $$
+$$ \tilde h_{1:K} = \mathrm{GRU}\left(\left[\mathrm{Emb}_{mover}, \mathrm{Emb}_{piece}, \mathrm{Emb}_{from}, \mathrm{Emb}_{to}, W_{flag}x_{flag}, W_{delta}x_h^{delta}\right]_{1:K}\right) $$
 
 $$ z_h = \frac{\sum_{k=1}^{K} m_k \tilde h_k}{\max\left(\sum_{k=1}^{K} m_k, 1\right)} $$
 
@@ -199,7 +199,7 @@ $$ \ell_u = g_{\mathrm{piece}}(z) $$
 
 $$ \hat P(u \mid z) = \mathrm{Softmax}(\mathrm{MaskPiece}(\ell_u)) $$
 
-$$ f = \mathrm{Gather}(\mathrm{piece\_slot\_to\_square}, u) $$
+$$ f = \mathrm{Gather}(M_{\mathrm{slot}\to\mathrm{sq}}, u) $$
 
 $$ e_f = E_{\square}(f) $$
 
